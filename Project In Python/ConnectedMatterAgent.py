@@ -2,15 +2,11 @@ import heapq
 import time
 import matplotlib.pyplot as plt
 from collections import deque
-from threading import Lock
-import concurrent.futures
-from functools import partial
 
-# Import the modules we've created
-from ObstacleHandler import ObstacleHandler
+# Import component handlers
 from MovementPhases import MovementPhases
-from DisconnectedGoalSequential import DisconnectedGoalSequential
-from DisconnectedGoalMultiThreaded import DisconnectedGoalMultiThreaded
+from ObstacleHandler import ObstacleHandler
+from DisconnectedGoal import DisconnectedGoalHandler
 
 class ConnectedMatterAgent:
     def __init__(self, grid_size, start_positions, goal_positions, topology="moore", max_simultaneous_moves=1, min_simultaneous_moves=1, obstacles=None):
@@ -32,6 +28,26 @@ class ConnectedMatterAgent:
         self.start_state = frozenset((x, y) for x, y in start_positions)
         self.goal_state = frozenset((x, y) for x, y in goal_positions)
         
+        # Cache for algorithmic optimization
+        self.valid_moves_cache = {}
+        self.articulation_points_cache = {}
+        self.connectivity_check_cache = {}
+        self.distance_map_cache = {}
+        
+        # Enhanced parameters for improved search
+        self.beam_width = 800  # Increased beam width for better exploration
+        self.max_iterations = 200000  # Limit iterations to prevent infinite loops
+        
+        # Track blocks that have reached their goal positions
+        self.blocks_at_goal = set()
+        
+        # For obstacle pathfinding optimization
+        self.obstacle_maze = None
+        
+        # Initialize component handlers
+        self.movement = MovementPhases(self)
+        self.obstacle_handler = ObstacleHandler(self)
+        
         # Check if goal state is disconnected and find components
         self.goal_components = self.find_disconnected_components(self.goal_state)
         self.is_goal_disconnected = len(self.goal_components) > 1
@@ -44,35 +60,15 @@ class ConnectedMatterAgent:
             self.goal_centroid = self.calculate_centroid(self.goal_positions)
         else:
             # Calculate the centroid of the goal positions for block movement phase
-            # Using exact position calculation instead of average to ensure precise positioning
             self.goal_centroid = self.calculate_centroid(self.goal_positions)
+            
+        # Initialize disconnected goal handler after centroids are calculated
+        self.disconnected_goal = DisconnectedGoalHandler(self)
         
-        # Cache for valid moves to avoid recomputation
-        self.valid_moves_cache = {}
-        
-        # For optimizing the search
-        self.articulation_points_cache = {}
-        self.connectivity_check_cache = {}
-        
-        # Enhanced parameters for improved search
-        self.beam_width = 800  # Increased beam width for better exploration
-        self.max_iterations = 200000  # Limit iterations to prevent infinite loops
-        
-        # Track blocks that have reached their goal positions
-        self.blocks_at_goal = set()
-        
-        # Initialize handlers
-        self.obstacle_handler = ObstacleHandler(grid_size, self.obstacles, self.directions)
+        # Build the obstacle maze after all handlers are initialized
         if obstacles:
-            self.obstacle_handler.build_obstacle_maze()
-        
-        # Initialize the movement phase handler
-        self.movement_phases = MovementPhases(self)
-        
-        # Initialize disconnected goal handlers
-        self.sequential_handler = DisconnectedGoalSequential(self)
-        self.disconnected_handler = DisconnectedGoalMultiThreaded(self)
-        
+            self.build_obstacle_maze()
+            
     def calculate_centroid(self, positions):
         """Calculate the centroid (average position) of a set of positions"""
         if not positions:
@@ -80,6 +76,12 @@ class ConnectedMatterAgent:
         x_sum = sum(pos[0] for pos in positions)
         y_sum = sum(pos[1] for pos in positions)
         return (x_sum / len(positions), y_sum / len(positions))
+    
+    def is_valid_position(self, pos):
+        """Check if a position is valid (in bounds and not an obstacle)"""
+        return (0 <= pos[0] < self.grid_size[0] and 
+                0 <= pos[1] < self.grid_size[1] and
+                pos not in self.obstacles)
     
     def is_connected(self, positions):
         """Check if all positions are connected using BFS"""
@@ -173,405 +175,6 @@ class ConnectedMatterAgent:
         self.articulation_points_cache[state_hash] = articulation_points
         return articulation_points
     
-    def get_valid_block_moves(self, state):
-        """
-        Generate valid moves for the entire block of elements
-        A valid block move shifts all elements in the same direction while maintaining connectivity
-        """
-        valid_moves = []
-        state_list = list(state)
-        
-        # Try moving the entire block in each direction
-        for dx, dy in self.directions:
-            # Calculate new positions after moving
-            new_positions = [(pos[0] + dx, pos[1] + dy) for pos in state_list]
-            
-            # Check if all new positions are valid (within bounds, not occupied by obstacles)
-            all_valid = all(0 <= pos[0] < self.grid_size[0] and 
-                            0 <= pos[1] < self.grid_size[1] and
-                            pos not in self.obstacles for pos in new_positions)
-            
-            # Only consider moves that keep all positions within bounds and not overlapping obstacles
-            if all_valid:
-                # Ensure no positions overlap - each position must be unique
-                if len(set(new_positions)) == len(new_positions):
-                    new_state = frozenset(new_positions)
-                    valid_moves.append(new_state)
-        
-        return valid_moves
-    
-    def get_valid_morphing_moves(self, state):
-        """
-        Generate valid morphing moves that maintain connectivity
-        Supports multiple simultaneous block movements with minimum requirement
-        Now optimized for obstacle environments
-        """
-        state_key = hash(state)
-        if state_key in self.valid_moves_cache:
-            return self.valid_moves_cache[state_key]
-            
-        # Get single block moves first
-        single_moves = []
-        state_set = set(state)
-        
-        # Identify blocks that have reached their goal positions
-        blocks_at_goal = state_set.intersection(self.goal_state)
-        self.blocks_at_goal = blocks_at_goal
-        
-        # Find non-critical points that can move without breaking connectivity
-        articulation_points = self.get_articulation_points(state_set)
-        
-        # Don't move blocks that have reached their goal positions
-        # unless they're the only blocks we can move (to avoid deadlock)
-        movable_points = state_set - articulation_points - blocks_at_goal
-        
-        # If all points are critical or at goal, try moving critical points that aren't at goals
-        if not movable_points:
-            for point in articulation_points - blocks_at_goal:
-                # Try removing and see if structure remains connected
-                temp_state = state_set.copy()
-                temp_state.remove(point)
-                if self.is_connected(temp_state):
-                    movable_points.add(point)
-                    
-        # If still no movable points and we have blocks at goal,
-        # allow minimal movement of goal blocks as last resort
-        if not movable_points and blocks_at_goal:
-            # Try moving goal blocks that aren't critical articulation points first
-            non_critical_goal_blocks = blocks_at_goal - articulation_points
-            if non_critical_goal_blocks:
-                for point in non_critical_goal_blocks:
-                    temp_state = state_set.copy()
-                    temp_state.remove(point)
-                    if self.is_connected(temp_state):
-                        movable_points.add(point)
-            
-            # If still stuck, try critical goal blocks as absolute last resort
-            if not movable_points:
-                for point in blocks_at_goal.intersection(articulation_points):
-                    temp_state = state_set.copy()
-                    temp_state.remove(point)
-                    if self.is_connected(temp_state):
-                        movable_points.add(point)
-        
-        # Generate single block moves, prioritizing moves toward the goal
-        for point in movable_points:
-            # Find closest goal position for this point
-            closest_goal = None
-            min_dist = float('inf')
-            
-            for goal_pos in self.goal_state:
-                if goal_pos not in state_set:  # Only consider unoccupied goals
-                    if self.obstacles:
-                        dist = self.obstacle_handler.obstacle_aware_distance(point, goal_pos)
-                    else:
-                        dist = abs(point[0] - goal_pos[0]) + abs(point[1] - goal_pos[1])
-                        
-                    if dist < min_dist:
-                        min_dist = dist
-                        closest_goal = goal_pos
-                        
-            # Prioritize directions toward the closest goal
-            ordered_directions = self.directions.copy()
-            if closest_goal:
-                # Calculate direction vectors
-                dx = 1 if closest_goal[0] > point[0] else -1 if closest_goal[0] < point[0] else 0
-                dy = 1 if closest_goal[1] > point[1] else -1 if closest_goal[1] < point[1] else 0
-                
-                # Put preferred direction first
-                preferred_dir = (dx, dy)
-                if preferred_dir in ordered_directions:
-                    ordered_directions.remove(preferred_dir)
-                    ordered_directions.insert(0, preferred_dir)
-                
-                # Also prioritize partial matches (just x or just y component)
-                for i, dir in enumerate(ordered_directions.copy()):
-                    if dir[0] == dx or dir[1] == dy:
-                        ordered_directions.remove(dir)
-                        ordered_directions.insert(1, dir)
-                
-            # Try moving in each direction, starting with preferred ones
-            for dx, dy in ordered_directions:
-                new_pos = (point[0] + dx, point[1] + dy)
-                
-                # Skip if out of bounds or is an obstacle
-                if not (0 <= new_pos[0] < self.grid_size[0] and 
-                        0 <= new_pos[1] < self.grid_size[1]):
-                    continue
-                    
-                # Skip if position is an obstacle
-                if new_pos in self.obstacles:
-                    continue
-                
-                # Skip if already occupied
-                if new_pos in state_set:
-                    continue
-                
-                # Create new state by moving the point
-                new_state_set = state_set.copy()
-                new_state_set.remove(point)
-                new_state_set.add(new_pos)
-                
-                # Check if new position is adjacent to at least one other point
-                has_adjacent = False
-                for adj_dx, adj_dy in self.directions:
-                    adj_pos = (new_pos[0] + adj_dx, new_pos[1] + adj_dy)
-                    if adj_pos in new_state_set and adj_pos != new_pos:
-                        has_adjacent = True
-                        break
-                
-                # Only consider moves that maintain connectivity
-                if has_adjacent and self.is_connected(new_state_set):
-                    single_moves.append((point, new_pos))
-                    
-        # Start with empty valid moves list
-        valid_moves = []
-        
-        # In dense obstacle environments, more simultaneous moves could be better
-        # Increase minimum number of simultaneous moves based on obstacle density
-        local_min_moves = self.min_simultaneous_moves
-        if len(self.obstacles) > 20 and local_min_moves == 1:
-            local_min_moves = min(2, self.max_simultaneous_moves)
-            
-        # Generate multi-block moves
-        for k in range(local_min_moves, min(self.max_simultaneous_moves + 1, len(single_moves) + 1)):
-            # Generate combinations of k moves
-            for combo in self._generate_move_combinations(single_moves, k):
-                # Check if the combination is valid (no conflicts)
-                if self._is_valid_move_combination(combo, state_set):
-                    # Apply the combination and check connectivity
-                    new_state = self._apply_moves(state_set, combo)
-                    if self.is_connected(new_state):
-                        valid_moves.append(frozenset(new_state))
-        
-        # If no valid moves with min_simultaneous_moves, fallback to single moves if allowed
-        if not valid_moves and self.min_simultaneous_moves == 1:
-            valid_moves = [frozenset(self._apply_moves(state_set, [move])) for move in single_moves]
-        
-        # Cache results
-        self.valid_moves_cache[state_key] = valid_moves
-        return valid_moves
-    
-    def _generate_move_combinations(self, single_moves, k):
-        """Generate all combinations of k moves from the list of single moves"""
-        if k == 1:
-            return [[move] for move in single_moves]
-        
-        result = []
-        for i in range(len(single_moves) - k + 1):
-            move = single_moves[i]
-            for combo in self._generate_move_combinations(single_moves[i+1:], k-1):
-                result.append([move] + combo)
-        
-        return result
-    
-    def _is_valid_move_combination(self, moves, state_set):
-        """Check if a combination of moves is valid (no conflicts)"""
-        # Extract source and target positions
-        sources = set()
-        targets = set()
-        
-        for src, tgt in moves:
-            # Check for overlapping sources or targets
-            if src in sources or tgt in targets:
-                return False
-            sources.add(src)
-            targets.add(tgt)
-            
-            # Check that no target is also a source for another move
-            if tgt in sources or src in targets:
-                return False
-                
-            # Check that target doesn't overlap with any non-moving block
-            non_moving_blocks = state_set - sources
-            if tgt in non_moving_blocks:
-                return False
-        
-        return True
-    
-    def _apply_moves(self, state_set, moves):
-        """Apply a list of moves to the state"""
-        new_state = state_set.copy()
-        
-        # First validate that we won't have any overlaps
-        sources = set()
-        targets = set()
-        
-        for src, tgt in moves:
-            sources.add(src)
-            targets.add(tgt)
-            
-        # Ensure we're not creating duplicate positions
-        # 1. No target should overlap with a non-moving block
-        non_moving_blocks = state_set - sources
-        if targets.intersection(non_moving_blocks):
-            return state_set  # Return original state if overlap detected
-            
-        # 2. No duplicate targets
-        if len(targets) != len(moves):
-            return state_set  # Return original state if duplicate targets
-        
-        # Apply moves only if valid
-        for src, tgt in moves:
-            new_state.remove(src)
-            new_state.add(tgt)
-            
-        # Verify we haven't lost any blocks
-        if len(new_state) != len(state_set):
-            print(f"WARNING: Block count changed from {len(state_set)} to {len(new_state)}")
-            return state_set  # Return original state if blocks were lost
-            
-        return new_state
-    
-    def get_smart_chain_moves(self, state):
-        """
-        Generate chain moves where one block moves into the space of another
-        while that block moves elsewhere, maintaining connectivity.
-        Enhanced to prioritize clearing paths in tight spaces.
-        """
-        state_set = set(state)
-        valid_moves = []
-        
-        # For each block, try to move it toward a goal position
-        for pos in state_set:
-            # Find closest goal position using obstacle-aware pathfinding
-            min_dist = float('inf')
-            closest_goal = None
-            
-            for goal_pos in self.goal_state:
-                if goal_pos not in state_set:  # Only consider unoccupied goals
-                    if self.obstacles:
-                        dist = self.obstacle_handler.obstacle_aware_distance(pos, goal_pos)
-                    else:
-                        dist = abs(pos[0] - goal_pos[0]) + abs(pos[1] - goal_pos[1])
-                    if dist < min_dist:
-                        min_dist = dist
-                        closest_goal = goal_pos
-            
-            if not closest_goal:
-                continue
-                
-            # Calculate direction toward goal
-            dx = 1 if closest_goal[0] > pos[0] else -1 if closest_goal[0] < pos[0] else 0
-            dy = 1 if closest_goal[1] > pos[1] else -1 if closest_goal[1] < pos[1] else 0
-            
-            # Try moving in that direction
-            next_pos = (pos[0] + dx, pos[1] + dy)
-            
-            # If next position is occupied, try chain move
-            if next_pos in state_set:
-                chain_pos = (next_pos[0] + dx, next_pos[1] + dy)
-                
-                # Check if chain position is valid
-                if chain_pos not in state_set and chain_pos not in self.obstacles:
-                    # Create new state by moving both blocks
-                    new_state_set = state_set.copy()
-                    new_state_set.remove(pos)
-                    new_state_set.remove(next_pos)
-                    new_state_set.add(next_pos)
-                    new_state_set.add(chain_pos)
-                    
-                    # Check if new state is connected
-                    if self.is_connected(new_state_set):
-                        valid_moves.append(frozenset(new_state_set))
-            else:
-                # Direct move if next position is unoccupied
-                new_state_set = state_set.copy()
-                new_state_set.remove(pos)
-                new_state_set.add(next_pos)
-                
-                # Check if new state is connected
-                if self.is_connected(new_state_set):
-                    valid_moves.append(frozenset(new_state_set))
-        
-        return valid_moves
-    
-    def get_sliding_chain_moves(self, state):
-        """
-        Generate sliding chain moves where multiple blocks move in sequence
-        to navigate tight spaces
-        """
-        state_set = set(state)
-        valid_moves = []
-        
-        # Identify blocks that have reached their goal positions
-        blocks_at_goal = state_set.intersection(self.goal_state)
-        
-        # For each block, try to initiate a sliding chain
-        for pos in state_set:
-            # Skip if it's at a goal position
-            if pos in blocks_at_goal:
-                continue
-                
-            # Skip if it's a critical articulation point
-            articulation_points = self.get_articulation_points(state_set)
-            if pos in articulation_points and len(articulation_points) <= 20:
-                continue
-                
-            # Try sliding in each direction
-            for dx, dy in self.directions:
-                # Only consider diagonal moves for sliding chains
-                if dx != 0 and dy != 0:
-                    # Define the sliding path (up to 3 steps)
-                    path = []
-                    current_pos = pos
-                    for _ in range(20):  # Maximum chain length
-                        next_pos = (current_pos[0] + dx, current_pos[1] + dy)
-                        # Stop if out of bounds or is an obstacle
-                        if not (0 <= next_pos[0] < self.grid_size[0] and 
-                                0 <= next_pos[1] < self.grid_size[1]):
-                            break
-                        if next_pos in self.obstacles:
-                            break
-                        path.append(next_pos)
-                        current_pos = next_pos
-                    
-                    # Try sliding the block along the path
-                    for i, target_pos in enumerate(path):
-                        # Skip if target is occupied
-                        if target_pos in state_set:
-                            continue
-                            
-                        # Create new state by moving the block
-                        new_state_set = state_set.copy()
-                        new_state_set.remove(pos)
-                        new_state_set.add(target_pos)
-                        
-                        # Check if new state is connected and has the correct number of blocks
-                        if self.is_connected(new_state_set) and len(new_state_set) == len(state_set):
-                            valid_moves.append(frozenset(new_state_set))
-                        
-                        # No need to continue if we can't reach this position
-                        break
-        
-        return valid_moves
-    
-    def get_all_valid_moves(self, state):
-        """
-        Combine all move generation methods to maximize options
-        """
-        # Start with basic morphing moves
-        basic_moves = self.get_valid_morphing_moves(state)
-        
-        # Add chain moves
-        chain_moves = self.get_smart_chain_moves(state)
-        
-        # Add sliding chain moves
-        sliding_moves = self.get_sliding_chain_moves(state)
-        
-        # Combine all moves (frozensets automatically handle duplicates)
-        all_moves = list(set(basic_moves + chain_moves + sliding_moves))
-        
-        # Verify all moves have the correct number of blocks
-        valid_moves = []
-        for move in all_moves:
-            if len(move) == len(state):
-                valid_moves.append(move)
-            else:
-                print(f"WARNING: Invalid move with {len(move)} blocks instead of {len(state)}")
-        
-        return valid_moves
-    
     def find_disconnected_components(self, positions):
         """
         Find all disconnected components in a set of positions using BFS
@@ -609,6 +212,10 @@ class ConnectedMatterAgent:
         
         return components
     
+    def build_obstacle_maze(self):
+        """Create a grid representation with obstacles for pathfinding"""
+        self.obstacle_handler.build_obstacle_maze()
+    
     def reconstruct_path(self, came_from, current):
         """
         Reconstruct the path from start to goal
@@ -627,8 +234,8 @@ class ConnectedMatterAgent:
         Now with dynamic time allocation based on obstacles
         """
         # Build obstacle maze representation if not already done
-        if self.obstacles and not self.obstacle_handler.obstacle_maze:
-            self.obstacle_handler.build_obstacle_maze()
+        if self.obstacles and not self.obstacle_maze:
+            self.build_obstacle_maze()
             
         # Dynamically allocate time based on obstacle density
         block_time_ratio = 0.3  # Default 30% for block movement
@@ -639,25 +246,9 @@ class ConnectedMatterAgent:
             # Allocate up to 50% for block movement in dense obstacle environments
             block_time_ratio = min(0.5, 0.3 + obstacle_density * 0.5)
             
-        # For disconnected goals, check if fully connected and choose approach accordingly
+        # For disconnected goals, adjust time allocation
         if self.is_goal_disconnected:
-            # Check if the goal state is connected
-            if self.is_connected(self.goal_state):
-                print("Goal appears disconnected but is actually connected, using standard search")
-                # If connected, use standard search approach
-            else:
-                try:
-                    # First try the multithreaded handler
-                    return self.disconnected_handler.search_disconnected_goal_multithreaded(time_limit)
-                except Exception as e:
-                    print(f"Multithreaded search failed: {e}")
-                    try:
-                        # Fall back to sequential handler
-                        return self.sequential_handler.search_disconnected_goal_sequential(time_limit)
-                    except Exception as e:
-                        print(f"Sequential search failed: {e}")
-                        # If both fail, fall back to standard search
-                        print("Falling back to standard search")
+            return self.disconnected_goal.search_disconnected_goal(time_limit)
             
         block_time_limit = time_limit * block_time_ratio
         morphing_time_limit = time_limit * (1 - block_time_ratio)
@@ -665,7 +256,7 @@ class ConnectedMatterAgent:
         print(f"Time allocation: {block_time_ratio:.1%} block movement, {1-block_time_ratio:.1%} morphing")
         
         # Phase 1: Block Movement
-        block_path = self.movement_phases.block_movement_phase(block_time_limit)
+        block_path = self.movement.block_movement_phase(block_time_limit)
         
         if not block_path:
             print("Block movement phase failed!")
@@ -675,7 +266,7 @@ class ConnectedMatterAgent:
         block_final_state = frozenset(block_path[-1])
         
         # Phase 2: Smarter Morphing
-        morphing_path = self.movement_phases.smarter_morphing_phase(block_final_state, morphing_time_limit)
+        morphing_path = self.movement.smarter_morphing_phase(block_final_state, morphing_time_limit)
         
         if not morphing_path:
             print("Morphing phase failed!")
@@ -715,8 +306,14 @@ class ConnectedMatterAgent:
         ax.set_xlim(min_x - 0.5, max_x + 0.5)
         ax.set_ylim(min_y - 0.5, max_y + 0.5)
         ax.grid(True)
+        
+        # Draw obstacles
+        obstacle_rects = []
+        for pos in self.obstacles:
+            rect = plt.Rectangle((pos[1] - 0.5, pos[0] - 0.5), 1, 1, facecolor='red', alpha=0.7)
+            ax.add_patch(rect)
+            obstacle_rects.append(rect)
     
-        # Track and display blocks at goal positions differently
         # Draw goal positions (as outlines)
         goal_rects = []
         for pos in self.goal_positions:
@@ -744,13 +341,6 @@ class ConnectedMatterAgent:
             rect = plt.Rectangle((pos[1] - 0.5, pos[0] - 0.5), 1, 1, facecolor='blue', alpha=0.7)
             ax.add_patch(rect)
             non_goal_rects.append(rect)
-            
-        # Draw obstacles (black squares)
-        obstacle_rects = []
-        for pos in self.obstacles:
-            rect = plt.Rectangle((pos[1] - 0.5, pos[0] - 0.5), 1, 1, facecolor='black')
-            ax.add_patch(rect)
-            obstacle_rects.append(rect)
         
         ax.set_title(f"Step 0/{len(path)-1} - {len(blocks_at_goal)} blocks at goal")
         plt.draw()
@@ -796,156 +386,98 @@ class ConnectedMatterAgent:
         plt.ioff()  # Turn off interactive mode
         plt.show(block=True)
     
+    def obstacle_aware_distance(self, pos, target):
+        """
+        Calculate the distance between a position and a target,
+        accounting for obstacles
+        """
+        return self.obstacle_handler.obstacle_aware_distance(pos, target)
+    
+    def find_clean_path(self, start_pos, end_pos, obstacles):
+        """
+        Find a clean path between two positions, avoiding all obstacles.
+        """
+        return self.obstacle_handler.find_clean_path(start_pos, end_pos, obstacles)
+    
     def disconnected_block_movement_phase(self, time_limit=15):
         """
         Modified Phase 1 for disconnected goal states:
         Moves the entire block toward a strategic position for splitting
         """
-        print("Starting Disconnected Block Movement Phase...")
-        start_time = time.time()
-        
-        # Find the closest goal component to the start state
-        closest_component_idx = self.find_closest_component()
-        closest_component = self.goal_components[closest_component_idx]
-        closest_centroid = self.component_centroids[closest_component_idx]
-        
-        # Determine if vertical positioning is better based on y-axis centroids
-        all_components_y = [centroid[1] for centroid in self.component_centroids]
-        overall_y = self.goal_centroid[1]
-        
-        # Check if centroid of all shapes is closer to y level of the closest shape
-        use_vertical_approach = abs(overall_y - closest_centroid[1]) < sum([abs(y - closest_centroid[1]) for y in all_components_y]) / len(all_components_y)
-        
-        if use_vertical_approach:
-            print("Using vertical approach for block movement")
-            # Target position is at the overall centroid with y-level of closest component
-            target_centroid = (self.goal_centroid[0], closest_centroid[1])
-        else:
-            print("Using standard approach for block movement")
-            # Target position is the overall centroid
-            target_centroid = self.goal_centroid
-            
-        # Cache original goal centroid and temporarily replace with target
-        original_centroid = self.goal_centroid
-        self.goal_centroid = target_centroid
-        
-        # Use standard A* search but with the modified target
-        open_set = [(self.movement_phases.block_heuristic(self.start_state), 0, self.start_state)]
-        closed_set = set()
-        g_score = {self.start_state: 0}
-        came_from = {self.start_state: None}
-        
-        # We want to get close to the target position
-        min_distance = 1.0
-        max_distance = 2.0
-
-        while open_set and time.time() - start_time < time_limit:
-            # Get state with lowest f-score
-            f, g, current = heapq.heappop(open_set)
-
-            # Skip if already processed
-            if current in closed_set:
-                continue
-        
-            # Check if we're at the desired distance from the goal centroid
-            current_centroid = self.calculate_centroid(current)
-            centroid_distance = (abs(current_centroid[0] - target_centroid[0]) + 
-                            abs(current_centroid[1] - target_centroid[1]))
-                        
-            if min_distance <= centroid_distance <= max_distance:
-                print(f"Block stopped at strategic position. Distance: {centroid_distance}")
-                # Restore original goal centroid
-                self.goal_centroid = original_centroid
-                return self.reconstruct_path(came_from, current)
-        
-            closed_set.add(current)
-
-            # Process neighbor states (block moves)
-            for neighbor in self.get_valid_block_moves(current):
-                if neighbor in closed_set:
-                    continue
-            
-                # Calculate tentative g-score
-                tentative_g = g_score[current] + 1
-        
-                if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                    # This is a better path
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g
-                
-                    # Adjust heuristic to prefer states close to target
-                    neighbor_centroid = self.calculate_centroid(neighbor)
-                    neighbor_distance = (abs(neighbor_centroid[0] - target_centroid[0]) + 
-                                    abs(neighbor_centroid[1] - target_centroid[1]))
-                
-                    # Penalize distances that are too small
-                    distance_penalty = 0
-                    if neighbor_distance < min_distance:
-                        distance_penalty = 10 * (min_distance - neighbor_distance)
-                
-                    # Calculate Manhattan distance to target
-                    if self.obstacles:
-                        neighbor_centroid_int = (int(round(neighbor_centroid[0])), int(round(neighbor_centroid[1])))
-                        target_centroid_int = (int(round(target_centroid[0])), int(round(target_centroid[1])))
-                        
-                        # Ensure centroids are within bounds
-                        neighbor_centroid_int = (
-                            max(0, min(neighbor_centroid_int[0], self.grid_size[0]-1)),
-                            max(0, min(neighbor_centroid_int[1], self.grid_size[1]-1))
-                        )
-                        target_centroid_int = (
-                            max(0, min(target_centroid_int[0], self.grid_size[0]-1)),
-                            max(0, min(target_centroid_int[1], self.grid_size[1]-1))
-                        )
-                        
-                        adjusted_heuristic = self.obstacle_handler.obstacle_aware_distance(neighbor_centroid_int, target_centroid_int) + distance_penalty
-                    else:
-                        adjusted_heuristic = neighbor_distance + distance_penalty
-                        
-                    f_score = tentative_g + adjusted_heuristic
-                    heapq.heappush(open_set, (f_score, tentative_g, neighbor))
-
-        # Restore original goal centroid
-        self.goal_centroid = original_centroid
-        
-        # If we exit the loop, find the best available state
-        if came_from:
-            best_state = None
-            best_distance_diff = float('inf')
-        
-            for state in came_from.keys():
-                state_centroid = self.calculate_centroid(state)
-                distance = (abs(state_centroid[0] - target_centroid[0]) + 
-                            abs(state_centroid[1] - target_centroid[1]))
-            
-                if distance < min_distance:
-                    distance_diff = min_distance - distance
-                elif distance > max_distance:
-                    distance_diff = distance - max_distance
-                else:
-                    best_state = state
-                    break
-                
-                if distance_diff < best_distance_diff:
-                    best_distance_diff = distance_diff
-                    best_state = state
-        
-            if best_state:
-                print(f"Best strategic position found for disconnected goal")
-                return self.reconstruct_path(came_from, best_state)
-
-        return [self.start_state]  # No movement possible
-        
+        return self.disconnected_goal.disconnected_block_movement_phase(time_limit)
+    
     def find_closest_component(self):
         """Find the index of the closest goal component to the start state"""
-        start_centroid = self.calculate_centroid(self.start_state)
-        min_distance = float('inf')
-        closest_idx = 0
-        
-        for idx, centroid in enumerate(self.component_centroids):
-            distance = abs(start_centroid[0] - centroid[0]) + abs(start_centroid[1] - centroid[1])
-            if distance < min_distance:
-                min_distance = distance
-                closest_idx = idx
-                
-        return closest_idx
+        return self.disconnected_goal.find_closest_component()
+    
+    def assign_blocks_to_components(self, state):
+        """
+        Returns a dictionary mapping each component index to a set of positions
+        """
+        return self.disconnected_goal.assign_blocks_to_components(state)
+    
+    def plan_disconnect_moves(self, state, assignments):
+        """
+        Plan a sequence of moves to disconnect the shape into separate components
+        """
+        return self.disconnected_goal.plan_disconnect_moves(state, assignments)
+    
+    def component_morphing_heuristic(self, state, goal_component):
+        """
+        Heuristic for morphing a specific component
+        """
+        return self.disconnected_goal.component_morphing_heuristic(state, goal_component)
+    
+    def component_morphing_phase(self, start_state, goal_component, time_limit=15):
+        """
+        Morph a specific component into its goal shape
+        """
+        return self.disconnected_goal.component_morphing_phase(start_state, goal_component, time_limit)
+    
+    def search_disconnected_goal(self, time_limit=100):
+        """
+        Search method for disconnected goal states
+        """
+        return self.disconnected_goal.search_disconnected_goal(time_limit)
+    
+    def is_full_disconnected_goal_reached(self, state):
+        """
+        Check if goal components are sufficiently matched in the current state.
+        """
+        return self.disconnected_goal.is_full_disconnected_goal_reached(state)
+    
+    def get_disconnected_valid_moves(self, state, goal_components):
+        """
+        Generate valid moves for disconnected components
+        """
+        return self.disconnected_goal.get_disconnected_valid_moves(state, goal_components)
+    
+    def sequential_from_strategic_position(self, strategic_state, time_limit=60):
+        """
+        Apply the sequential component-by-component approach
+        """
+        return self.disconnected_goal.sequential_from_strategic_position(strategic_state, time_limit)
+    
+    def cleanup_and_retry(self, current_state, time_limit=20):
+        """
+        Cleanup phase with strict block count verification.
+        """
+        return self.disconnected_goal.cleanup_and_retry(current_state, time_limit)
+    
+    def reconnect_clusters_strict(self, clusters, cluster_distances, current_state, blocks_at_goal, cleanup_path, original_block_count):
+        """
+        Individual block movement with continuous connectivity checks.
+        """
+        return self.disconnected_goal.reconnect_clusters_strict(clusters, cluster_distances, current_state, blocks_at_goal, cleanup_path, original_block_count)
+    
+    def check_and_reconnect_blocks(self, current_blocks, blocks_at_goal, connected_blocks, remaining_cluster, cleanup_path, original_block_count):
+        """
+        Check if there are blocks that need to be reconnected and handle them.
+        """
+        return self.disconnected_goal.check_and_reconnect_blocks(current_blocks, blocks_at_goal, connected_blocks, remaining_cluster, cleanup_path, original_block_count)
+    
+    def detect_and_fix_connection(self, cluster1, cluster2):
+        """
+        Detects if two clusters are adjacent and fixes the connection if needed.
+        """
+        return self.disconnected_goal.detect_and_fix_connection(cluster1, cluster2)
