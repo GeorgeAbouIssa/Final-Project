@@ -1,18 +1,25 @@
+# cython: language_level=3
 import heapq
 import time
 from collections import deque
 
-class MovementPhases:
+cdef class MovementPhases:
+    cdef public:
+        object agent  # Reference to the main agent
+    
     def __init__(self, agent):
         self.agent = agent
         
-    def get_valid_block_moves(self, state):
+    cpdef list get_valid_block_moves(self, state):
         """
         Generate valid moves for the entire block of elements
         A valid block move shifts all elements in the same direction while maintaining connectivity
         """
-        valid_moves = []
-        state_list = list(state)
+        cdef list valid_moves = []
+        cdef list state_list = list(state)
+        cdef list new_positions
+        cdef bint all_valid
+        cdef object new_state
         
         # Try moving the entire block in each direction
         for dx, dy in self.agent.directions:
@@ -36,11 +43,21 @@ class MovementPhases:
         
         return valid_moves
     
-    def get_valid_morphing_moves(self, state):
+    cpdef list get_valid_morphing_moves(self, state):
         """
         Generate valid morphing moves that maintain connectivity
         Supports multiple simultaneous block movements with minimum requirement
         """
+        cdef int state_key
+        cdef list valid_moves, single_moves, ordered_directions
+        cdef set state_set, blocks_at_goal, articulation_points, movable_points
+        cdef set non_critical_goal_blocks, temp_state
+        cdef tuple point, closest_goal, preferred_dir
+        cdef int min_dist, dx, dy, i
+        cdef tuple new_pos, adj_pos
+        cdef bint has_adjacent
+        cdef int local_min_moves, k
+        
         state_key = hash(state)
         if state_key in self.agent.valid_moves_cache:
             return self.agent.valid_moves_cache[state_key]
@@ -185,8 +202,13 @@ class MovementPhases:
         self.agent.valid_moves_cache[state_key] = valid_moves
         return valid_moves
     
-    def _generate_move_combinations(self, single_moves, k):
+    cpdef list _generate_move_combinations(self, list single_moves, int k):
         """Generate all combinations of k moves from the list of single moves"""
+        cdef list result
+        cdef int i
+        cdef object move
+        cdef list combo
+        
         if k == 1:
             return [[move] for move in single_moves]
         
@@ -198,11 +220,13 @@ class MovementPhases:
         
         return result
     
-    def _is_valid_move_combination(self, moves, state_set):
+    cpdef bint _is_valid_move_combination(self, list moves, set state_set):
         """Check if a combination of moves is valid (no conflicts)"""
         # Extract source and target positions
-        sources = set()
-        targets = set()
+        cdef set sources = set()
+        cdef set targets = set()
+        cdef tuple src, tgt
+        cdef set non_moving_blocks
         
         for src, tgt in moves:
             # Check for overlapping sources or targets
@@ -227,14 +251,15 @@ class MovementPhases:
         
         return True
     
-    def _apply_moves(self, state_set, moves):
+    cpdef set _apply_moves(self, set state_set, list moves):
         """Apply a list of moves to the state"""
-        new_state = state_set.copy()
+        cdef set new_state = state_set.copy()
+        cdef set sources = set()
+        cdef set targets = set()
+        cdef tuple src, tgt
+        cdef set non_moving_blocks
         
         # First validate that we won't have any overlaps
-        sources = set()
-        targets = set()
-        
         for src, tgt in moves:
             sources.add(src)
             targets.add(tgt)
@@ -267,14 +292,17 @@ class MovementPhases:
             
         return new_state
     
-    def get_smart_chain_moves(self, state):
+    cpdef list get_smart_chain_moves(self, state):
         """
         Generate chain moves where one block moves into the space of another
         while that block moves elsewhere, maintaining connectivity.
         Enhanced to prioritize clearing paths in tight spaces.
         """
-        state_set = set(state)
-        valid_moves = []
+        cdef set state_set = set(state)
+        cdef list valid_moves = []
+        cdef tuple pos, closest_goal, next_pos, chain_pos
+        cdef int min_dist, dx, dy
+        cdef set new_state_set
         
         # For each block, try to move it toward a goal position
         for pos in state_set:
@@ -331,13 +359,18 @@ class MovementPhases:
         
         return valid_moves
     
-    def get_sliding_chain_moves(self, state):
+    cpdef list get_sliding_chain_moves(self, state):
         """
         Generate sliding chain moves where multiple blocks move in sequence
         to navigate tight spaces
         """
-        state_set = set(state)
-        valid_moves = []
+        cdef set state_set = set(state)
+        cdef list valid_moves = []
+        cdef set blocks_at_goal, articulation_points
+        cdef tuple pos, current_pos, next_pos, target_pos
+        cdef list path
+        cdef int i
+        cdef set new_state_set
         
         # Identify blocks that have reached their goal positions
         blocks_at_goal = state_set.intersection(self.agent.goal_state)
@@ -388,10 +421,13 @@ class MovementPhases:
         
         return valid_moves
     
-    def get_all_valid_moves(self, state):
+    cpdef list get_all_valid_moves(self, state):
         """
         Combine all move generation methods to maximize options
         """
+        cdef list basic_moves, chain_moves, sliding_moves, all_moves, valid_moves
+        cdef object move
+        
         # Start with basic morphing moves
         basic_moves = self.get_valid_morphing_moves(state)
         
@@ -414,11 +450,15 @@ class MovementPhases:
         
         return valid_moves
     
-    def block_heuristic(self, state):
+    cpdef double block_heuristic(self, state):
         """
         Heuristic for block movement phase:
         Accounts for obstacles between current position and goal
         """
+        cdef double x_sum, y_sum, missing_penalty
+        cdef int missing_blocks
+        cdef tuple current_centroid, current_centroid_int, goal_centroid_int
+        
         if not state:
             return float('inf')
         
@@ -452,12 +492,19 @@ class MovementPhases:
         # Get obstacle-aware distance
         return self.agent.obstacle_aware_distance(current_centroid_int, goal_centroid_int)
     
-    def improved_morphing_heuristic(self, state):
+    cpdef double improved_morphing_heuristic(self, state):
         """
         Improved heuristic for morphing phase:
         Uses bipartite matching to find optimal assignment of blocks to goal positions,
         now accounts for obstacles
         """
+        cdef list state_list, goal_list, row_indices, distances
+        cdef int missing_blocks, goal_bonus, total_distance
+        cdef double missing_penalty
+        cdef int i, j, min_dist, best_j
+        cdef set blocks_at_goal, assigned_cols
+        cdef tuple pos, goal_pos
+        
         if not state:
             return float('inf')
         
@@ -535,18 +582,27 @@ class MovementPhases:
         # Return total distance plus goal bonus
         return total_distance + goal_bonus
     
-    def block_movement_phase(self, time_limit=15):
+    cpdef list block_movement_phase(self, double time_limit=15):
         """
         Phase 1: Move the entire block toward the goal centroid
         Returns the path of states to get near the goal area
         Modified to stop 1 grid cell before reaching the goal centroid
         """
+        cdef double start_time
+        cdef list open_set
+        cdef set closed_set
+        cdef dict g_score, came_from
+        cdef double f, centroid_distance, min_distance, max_distance, distance, best_distance_diff, distance_diff, neighbor_distance, distance_penalty, f_score
+        cdef int g
+        cdef object current, neighbor
+        cdef tuple current_centroid, best_state, best_centroid, state_centroid, neighbor_centroid
+        
         print("Starting Block Movement Phase...")
         start_time = time.time()
 
         # For disconnected goals, use the modified approach
         if self.agent.is_goal_disconnected:
-            return self.agent.disconnected_block_movement_phase(time_limit)
+            return self.agent.disconnected_goal.disconnected_block_movement_phase(time_limit)
 
         # Initialize A* search
         open_set = [(self.block_heuristic(self.agent.start_state), 0, self.agent.start_state)]
@@ -646,12 +702,21 @@ class MovementPhases:
     
         return [self.agent.start_state]  # No movement possible
     
-    def smarter_morphing_phase(self, start_state, time_limit=15):
+    cpdef list smarter_morphing_phase(self, start_state, double time_limit=15):
         """
         Improved Phase 2: Morph the block into the goal shape while maintaining connectivity
         Uses beam search and intelligent move generation with support for simultaneous moves
         Now with adaptive beam width based on obstacle density
         """
+        cdef double start_time, obstacle_density, last_improvement_time, stagnation_tolerance
+        cdef int adaptive_beam_width, max_blocks_at_goal, iterations, blocks_at_goal_current, blocks_at_goal_neighbor, goal_position_bonus
+        cdef list open_set, neighbors
+        cdef set closed_set
+        cdef dict g_score, came_from
+        cdef double f, current_heuristic, best_heuristic, tentative_g, f_score
+        cdef int g
+        cdef object current, best_state, neighbor
+        
         print(f"Starting Smarter Morphing Phase with {self.agent.min_simultaneous_moves}-{self.agent.max_simultaneous_moves} simultaneous moves...")
         start_time = time.time()
         

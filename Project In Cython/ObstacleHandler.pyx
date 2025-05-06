@@ -1,12 +1,18 @@
+# cython: language_level=3
 from collections import deque
 import heapq
 
-class ObstacleHandler:
+cdef class ObstacleHandler:
+    cdef public:
+        object agent  # Reference to the main agent
+    
     def __init__(self, agent):
         self.agent = agent
     
-    def build_obstacle_maze(self):
+    cpdef build_obstacle_maze(self):
         """Create a grid representation with obstacles for pathfinding"""
+        cdef int x, y
+        
         # Initialize obstacle maze grid
         self.agent.obstacle_maze = [[0 for _ in range(self.agent.grid_size[1])] for _ in range(self.agent.grid_size[0])]
         
@@ -18,11 +24,17 @@ class ObstacleHandler:
         # Clear the distance map cache when obstacles change
         self.agent.distance_map_cache = {}
         
-    def calculate_distance_map(self, target):
+    cpdef list calculate_distance_map(self, tuple target):
         """
         Calculate distance map from all cells to the target,
         accounting for obstacles (using BFS for accurate distances)
         """
+        cdef list dist_map
+        cdef object queue
+        cdef set visited
+        cdef tuple pos
+        cdef int x, y, nx, ny, dist
+        
         # Check if we've already computed this map
         if target in self.agent.distance_map_cache:
             return self.agent.distance_map_cache[target]
@@ -55,11 +67,13 @@ class ObstacleHandler:
         self.agent.distance_map_cache[target] = dist_map
         return dist_map
         
-    def obstacle_aware_distance(self, pos, target):
+    cpdef double obstacle_aware_distance(self, tuple pos, tuple target):
         """
         Calculate the distance between a position and a target,
         accounting for obstacles
         """
+        cdef list dist_map
+        
         # If no obstacles, use Manhattan distance for speed
         if not self.agent.obstacles:
             return abs(pos[0] - target[0]) + abs(pos[1] - target[1])
@@ -77,7 +91,7 @@ class ObstacleHandler:
     
         return dist_map[pos[0]][pos[1]]
     
-    def find_clean_path(self, start_pos, end_pos, obstacles):
+    cpdef list find_clean_path(self, tuple start_pos, tuple end_pos, set obstacles):
         """
         Find a clean path between two positions, avoiding all obstacles.
         
@@ -89,6 +103,12 @@ class ObstacleHandler:
         Returns:
             List of positions forming a path, or None if no path found
         """
+        cdef set all_obstacles, closed_set
+        cdef list open_set, path
+        cdef dict came_from, g_score
+        cdef tuple current, neighbor
+        cdef int tentative_g, f_score
+        
         # Combine the passed obstacles with the agent's permanent obstacles
         all_obstacles = obstacles.union(self.agent.obstacles)
         

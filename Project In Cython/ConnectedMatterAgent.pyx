@@ -1,15 +1,44 @@
+# cython: language_level=3
 import heapq
 import time
 import matplotlib.pyplot as plt
 from collections import deque
+from libc.math cimport abs as c_abs
 
 # Import component handlers
-from MovementPhases import MovementPhases
-from ObstacleHandler import ObstacleHandler
-from DisconnectedGoal import DisconnectedGoalHandler
+from MovementPhases cimport MovementPhases
+from ObstacleHandler cimport ObstacleHandler
+from DisconnectedGoal cimport DisconnectedGoalHandler
 
-class ConnectedMatterAgent:
-    def __init__(self, grid_size, start_positions, goal_positions, topology="moore", max_simultaneous_moves=1, min_simultaneous_moves=1, obstacles=None):
+cdef class ConnectedMatterAgent:
+    cdef public:
+        tuple grid_size
+        list start_positions
+        list goal_positions
+        str topology
+        int max_simultaneous_moves
+        int min_simultaneous_moves
+        set obstacles
+        list directions
+        frozenset start_state
+        frozenset goal_state
+        dict valid_moves_cache
+        dict articulation_points_cache
+        dict connectivity_check_cache
+        dict distance_map_cache
+        int beam_width
+        int max_iterations
+        set blocks_at_goal
+        object obstacle_maze
+        MovementPhases movement
+        ObstacleHandler obstacle_handler
+        list goal_components
+        bint is_goal_disconnected
+        list component_centroids
+        tuple goal_centroid
+        DisconnectedGoalHandler disconnected_goal
+        
+    def __init__(self, grid_size, start_positions, goal_positions, str topology="moore", int max_simultaneous_moves=1, int min_simultaneous_moves=1, obstacles=None):
         self.grid_size = grid_size
         self.start_positions = list(start_positions)
         self.goal_positions = list(goal_positions)
@@ -69,22 +98,32 @@ class ConnectedMatterAgent:
         if obstacles:
             self.build_obstacle_maze()
             
-    def calculate_centroid(self, positions):
+    cpdef tuple calculate_centroid(self, positions):
         """Calculate the centroid (average position) of a set of positions"""
+        cdef double x_sum, y_sum
+        cdef int count
+        
         if not positions:
             return (0, 0)
         x_sum = sum(pos[0] for pos in positions)
         y_sum = sum(pos[1] for pos in positions)
-        return (x_sum / len(positions), y_sum / len(positions))
+        count = len(positions)
+        return (x_sum / count, y_sum / count)
     
-    def is_valid_position(self, pos):
+    cpdef bint is_valid_position(self, tuple pos):
         """Check if a position is valid (in bounds and not an obstacle)"""
         return (0 <= pos[0] < self.grid_size[0] and 
                 0 <= pos[1] < self.grid_size[1] and
                 pos not in self.obstacles)
     
-    def is_connected(self, positions):
+    cpdef bint is_connected(self, positions):
         """Check if all positions are connected using BFS"""
+        cdef int positions_hash
+        cdef set positions_set, visited
+        cdef object queue
+        cdef tuple current, neighbor, start
+        cdef bint is_connected
+        
         if not positions:
             return True
             
@@ -118,11 +157,19 @@ class ConnectedMatterAgent:
         self.connectivity_check_cache[positions_hash] = is_connected
         return is_connected
     
-    def get_articulation_points(self, state_set):
+    cpdef set get_articulation_points(self, set state_set):
         """
         Find articulation points (critical points that if removed would disconnect the structure)
         Uses a modified DFS algorithm
         """
+        cdef int state_hash
+        cdef set articulation_points
+        cdef set visited
+        cdef dict discovery, low, parent
+        cdef list time
+        cdef tuple u, v
+        cdef int children
+        
         state_hash = hash(frozenset(state_set))
         if state_hash in self.articulation_points_cache:
             return self.articulation_points_cache[state_hash]
@@ -139,7 +186,9 @@ class ConnectedMatterAgent:
         time = [0]  # Using list to allow modification inside nested function
         
         def dfs(u, time):
-            children = 0
+            cdef int children = 0
+            cdef tuple v
+            
             visited.add(u)
             discovery[u] = low[u] = time[0]
             time[0] += 1
@@ -175,11 +224,17 @@ class ConnectedMatterAgent:
         self.articulation_points_cache[state_hash] = articulation_points
         return articulation_points
     
-    def find_disconnected_components(self, positions):
+    cpdef list find_disconnected_components(self, positions):
         """
         Find all disconnected components in a set of positions using BFS
         Returns a list of sets, where each set contains positions in one component
         """
+        cdef set positions_set
+        cdef list components
+        cdef set component
+        cdef tuple start, current, neighbor
+        cdef object queue
+        
         if not positions:
             return []
             
@@ -212,15 +267,16 @@ class ConnectedMatterAgent:
         
         return components
     
-    def build_obstacle_maze(self):
+    cpdef build_obstacle_maze(self):
         """Create a grid representation with obstacles for pathfinding"""
         self.obstacle_handler.build_obstacle_maze()
     
-    def reconstruct_path(self, came_from, current):
+    cpdef list reconstruct_path(self, dict came_from, current):
         """
         Reconstruct the path from start to goal
         """
-        path = []
+        cdef list path = []
+        
         while current:
             path.append(list(current))
             current = came_from.get(current)
@@ -228,11 +284,17 @@ class ConnectedMatterAgent:
         path.reverse()
         return path
     
-    def search(self, time_limit=30):
+    cpdef list search(self, double time_limit=30):
         """
         Main search method combining block movement and smarter morphing
         Now with dynamic time allocation based on obstacles
         """
+        cdef double block_time_ratio, obstacle_density
+        cdef double block_time_limit, morphing_time_limit
+        cdef list block_path, morphing_path, combined_path
+        cdef object block_final_state
+        cdef int expected_count, i
+        
         # Build obstacle maze representation if not already done
         if self.obstacles and not self.obstacle_maze:
             self.build_obstacle_maze()
@@ -286,10 +348,14 @@ class ConnectedMatterAgent:
         
         return combined_path
     
-    def visualize_path(self, path, interval=0.5):
+    cpdef visualize_path(self, path, double interval=0.5):
         """
         Visualize the path as an animation
         """
+        cdef int min_x, max_x, min_y, max_y, i
+        cdef list goal_rects, obstacle_rects, goal_block_rects, non_goal_rects
+        cdef list new_positions, blocks_at_goal, blocks_not_at_goal
+        
         if not path:
             print("No path to visualize")
             return
@@ -386,98 +452,15 @@ class ConnectedMatterAgent:
         plt.ioff()  # Turn off interactive mode
         plt.show(block=True)
     
-    def obstacle_aware_distance(self, pos, target):
+    cpdef double obstacle_aware_distance(self, tuple pos, tuple target):
         """
         Calculate the distance between a position and a target,
         accounting for obstacles
         """
         return self.obstacle_handler.obstacle_aware_distance(pos, target)
     
-    def find_clean_path(self, start_pos, end_pos, obstacles):
+    cpdef list find_clean_path(self, tuple start_pos, tuple end_pos, set obstacles):
         """
         Find a clean path between two positions, avoiding all obstacles.
         """
         return self.obstacle_handler.find_clean_path(start_pos, end_pos, obstacles)
-    
-    def disconnected_block_movement_phase(self, time_limit=15):
-        """
-        Modified Phase 1 for disconnected goal states:
-        Moves the entire block toward a strategic position for splitting
-        """
-        return self.disconnected_goal.disconnected_block_movement_phase(time_limit)
-    
-    def find_closest_component(self):
-        """Find the index of the closest goal component to the start state"""
-        return self.disconnected_goal.find_closest_component()
-    
-    def assign_blocks_to_components(self, state):
-        """
-        Returns a dictionary mapping each component index to a set of positions
-        """
-        return self.disconnected_goal.assign_blocks_to_components(state)
-    
-    def plan_disconnect_moves(self, state, assignments):
-        """
-        Plan a sequence of moves to disconnect the shape into separate components
-        """
-        return self.disconnected_goal.plan_disconnect_moves(state, assignments)
-    
-    def component_morphing_heuristic(self, state, goal_component):
-        """
-        Heuristic for morphing a specific component
-        """
-        return self.disconnected_goal.component_morphing_heuristic(state, goal_component)
-    
-    def component_morphing_phase(self, start_state, goal_component, time_limit=15):
-        """
-        Morph a specific component into its goal shape
-        """
-        return self.disconnected_goal.component_morphing_phase(start_state, goal_component, time_limit)
-    
-    def search_disconnected_goal(self, time_limit=100):
-        """
-        Search method for disconnected goal states
-        """
-        return self.disconnected_goal.search_disconnected_goal(time_limit)
-    
-    def is_full_disconnected_goal_reached(self, state):
-        """
-        Check if goal components are sufficiently matched in the current state.
-        """
-        return self.disconnected_goal.is_full_disconnected_goal_reached(state)
-    
-    def get_disconnected_valid_moves(self, state, goal_components):
-        """
-        Generate valid moves for disconnected components
-        """
-        return self.disconnected_goal.get_disconnected_valid_moves(state, goal_components)
-    
-    def sequential_from_strategic_position(self, strategic_state, time_limit=60):
-        """
-        Apply the sequential component-by-component approach
-        """
-        return self.disconnected_goal.sequential_from_strategic_position(strategic_state, time_limit)
-    
-    def cleanup_and_retry(self, current_state, time_limit=20):
-        """
-        Cleanup phase with strict block count verification.
-        """
-        return self.disconnected_goal.cleanup_and_retry(current_state, time_limit)
-    
-    def reconnect_clusters_strict(self, clusters, cluster_distances, current_state, blocks_at_goal, cleanup_path, original_block_count):
-        """
-        Individual block movement with continuous connectivity checks.
-        """
-        return self.disconnected_goal.reconnect_clusters_strict(clusters, cluster_distances, current_state, blocks_at_goal, cleanup_path, original_block_count)
-    
-    def check_and_reconnect_blocks(self, current_blocks, blocks_at_goal, connected_blocks, remaining_cluster, cleanup_path, original_block_count):
-        """
-        Check if there are blocks that need to be reconnected and handle them.
-        """
-        return self.disconnected_goal.check_and_reconnect_blocks(current_blocks, blocks_at_goal, connected_blocks, remaining_cluster, cleanup_path, original_block_count)
-    
-    def detect_and_fix_connection(self, cluster1, cluster2):
-        """
-        Detects if two clusters are adjacent and fixes the connection if needed.
-        """
-        return self.disconnected_goal.detect_and_fix_connection(cluster1, cluster2)

@@ -1,21 +1,41 @@
+# cython: language_level=3
 import heapq
 import time
 from collections import deque
 import concurrent.futures
 import threading
 
-# Current Date: 2025-05-06 05:45:44
+# Current Date: 2025-05-06 06:14:32
 # User: GeorgeAbouIssa
 
-class DisconnectedGoalHandler:
+cdef class DisconnectedGoalHandler:
+    cdef public:
+        object agent  # Reference to the main agent
+            
     def __init__(self, agent):
         self.agent = agent
             
-    def disconnected_block_movement_phase(self, time_limit=15):
+    cpdef list disconnected_block_movement_phase(self, double time_limit=15):
         """
         Modified Phase 1 for disconnected goal states:
         Moves the entire block toward a strategic position for splitting
         """
+        cdef double start_time
+        cdef int closest_component_idx
+        cdef set closest_component
+        cdef tuple closest_centroid, target_centroid, original_centroid
+        cdef list all_components_y, path
+        cdef double overall_y, obstacle_density
+        cdef bint use_vertical_approach
+        cdef list open_set
+        cdef set closed_set
+        cdef dict g_score, came_from
+        cdef double f, min_distance, max_distance, centroid_distance, distance_penalty, neighbor_distance, adjusted_heuristic, f_score
+        cdef int g, tentative_g
+        cdef object current, neighbor, best_state
+        cdef tuple current_centroid, neighbor_centroid, neighbor_centroid_int, target_centroid_int
+        cdef double best_distance_diff, distance_diff
+        
         print("Starting Disconnected Block Movement Phase...")
         start_time = time.time()
         
@@ -151,8 +171,12 @@ class DisconnectedGoalHandler:
     
         return [self.agent.start_state]  # No movement possible
     
-    def find_closest_component(self):
+    cpdef int find_closest_component(self):
         """Find the index of the closest goal component to the start state"""
+        cdef tuple start_centroid
+        cdef double min_distance, distance
+        cdef int closest_idx, idx
+        
         start_centroid = self.agent.calculate_centroid(self.agent.start_state)
         min_distance = float('inf')
         closest_idx = 0
@@ -165,10 +189,18 @@ class DisconnectedGoalHandler:
                 
         return closest_idx
     
-    def assign_blocks_to_components(self, state):
+    cpdef dict assign_blocks_to_components(self, state):
         """
         Returns a dictionary mapping each component index to a set of positions
         """
+        cdef dict assignments
+        cdef list state_positions, component_sizes, distances
+        cdef set assigned, unassigned
+        cdef int total_blocks_needed, idx, component_idx, i
+        cdef tuple pos, centroid
+        cdef list pos_distances
+        cdef double dist
+        
         assignments = {i: set() for i in range(len(self.agent.goal_components))}
         state_positions = list(state)
         
@@ -225,11 +257,18 @@ class DisconnectedGoalHandler:
                 
         return assignments
     
-    def plan_disconnect_moves(self, state, assignments):
+    cpdef list plan_disconnect_moves(self, state, dict assignments):
         """
         Plan a sequence of moves to disconnect the shape into separate components
         Returns a list of states representing the disconnection process
         """
+        cdef set current_state
+        cdef list path, component_positions
+        cdef bint is_separable
+        cdef int i, j
+        cdef set pos_i, pos_j, connection_points
+        cdef tuple pos_i_t, pos_j_t
+        
         # Start with current state
         current_state = set(state)
         path = [frozenset(current_state)]
@@ -242,10 +281,10 @@ class DisconnectedGoalHandler:
         for i in range(len(component_positions)):
             for j in range(i+1, len(component_positions)):
                 # Check if there's a direct connection between components
-                for pos_i in component_positions[i]:
-                    for pos_j in component_positions[j]:
+                for pos_i_t in component_positions[i]:
+                    for pos_j_t in component_positions[j]:
                         # Check if positions are adjacent
-                        if any((pos_i[0] + dx, pos_i[1] + dy) == pos_j for dx, dy in self.agent.directions):
+                        if any((pos_i_t[0] + dx, pos_i_t[1] + dy) == pos_j_t for dx, dy in self.agent.directions):
                             is_separable = False
                             break
                     if not is_separable:
@@ -265,13 +304,13 @@ class DisconnectedGoalHandler:
         for i in range(len(component_positions)):
             for j in range(i+1, len(component_positions)):
                 # Find all connections between components i and j
-                for pos_i in component_positions[i]:
-                    for pos_j in component_positions[j]:
+                for pos_i_t in component_positions[i]:
+                    for pos_j_t in component_positions[j]:
                         # Check if positions are adjacent
-                        if any((pos_i[0] + dx, pos_i[1] + dy) == pos_j for dx, dy in self.agent.directions):
+                        if any((pos_i_t[0] + dx, pos_i_t[1] + dy) == pos_j_t for dx, dy in self.agent.directions):
                             # Add both positions to connection points
-                            connection_points.add(pos_i)
-                            connection_points.add(pos_j)
+                            connection_points.add(pos_i_t)
+                            connection_points.add(pos_j_t)
         
         # For theoretical disconnection, we don't need to actually move blocks
         # Just mark the connection points as if they're disconnected
@@ -281,10 +320,16 @@ class DisconnectedGoalHandler:
         # The actual disconnection will happen during the morphing phase
         return path
     
-    def component_morphing_heuristic(self, state, goal_component):
+    cpdef double component_morphing_heuristic(self, state, goal_component):
         """
         Heuristic for morphing a specific component
         """
+        cdef int missing_blocks, missing_penalty, matching_positions, connectivity_bonus
+        cdef list state_list, goal_list, distances, row, row_indices
+        cdef tuple pos, goal_pos
+        cdef set assigned_cols, goal_component_set
+        cdef int total_distance, i, j, min_dist, best_j
+        
         if not state:
             return float('inf')
         
@@ -351,10 +396,20 @@ class DisconnectedGoalHandler:
         
         return total_distance + connectivity_bonus
     
-    def component_morphing_phase(self, start_state, goal_component, time_limit=15):
+    cpdef list component_morphing_phase(self, start_state, goal_component, double time_limit=15):
         """
         Morph a specific component into its goal shape
         """
+        cdef double start_time, obstacle_density, current_heuristic, best_heuristic, last_improvement_time, stagnation_tolerance
+        cdef int adaptive_beam_width, iterations
+        cdef list open_set, neighbors
+        cdef set closed_set
+        cdef dict g_score, came_from
+        cdef double f, f_score
+        cdef int g, tentative_g
+        cdef object current, best_state, neighbor
+        cdef object goal_component_set
+        
         start_time = time.time()
         
         # Adapt beam width based on obstacle density
@@ -457,7 +512,7 @@ class DisconnectedGoalHandler:
         print(f"Component morphing timed out after {iterations} iterations!")
         return self.agent.reconstruct_path(came_from, best_state)
     
-    def search_disconnected_goal(self, time_limit=100):
+    cpdef list search_disconnected_goal(self, double time_limit=100):
         """
         Search method for disconnected goal states:
         1. First try parallel approach:
@@ -467,8 +522,18 @@ class DisconnectedGoalHandler:
         2. If parallel approach fails, try sequential approach, still using the 
            strategic position from Phase 1
         """
+        cdef double start_time, parallel_time_limit, sequential_time_limit, move_time_ratio, disconnect_time_ratio, morphing_time_ratio
+        cdef double obstacle_density, move_time_limit, disconnect_time_limit, morphing_time_limit, assignments_start_time, disconnect_time_used
+        cdef double remaining_time
+        cdef list block_path, disconnect_path, combined_path, component_paths, component_start_states, component_time_limits, sequential_path, final_path
+        cdef object block_final_state, assignments
+        cdef int total_blocks, i
+        cdef object shared_grid_lock
+        cdef set shared_occupied_cells
+        cdef list component_locks, component_occupied_cells, futures
+        
         print(f"Starting search for disconnected goal with {len(self.agent.goal_components)} components")
-        print(f"Current date: 2025-05-06 05:45:44, User: GeorgeAbouIssa")
+        print(f"Current date: 2025-05-06 06:14:32, User: GeorgeAbouIssa")
         start_time = time.time()
 
         # Reserve time for sequential approach if needed
@@ -686,11 +751,17 @@ class DisconnectedGoalHandler:
 
         return combined_path
     
-    def is_full_disconnected_goal_reached(self, state):
+    cpdef bint is_full_disconnected_goal_reached(self, state):
         """
         Check if goal components are sufficiently matched in the current state.
         Allows for some tolerance in the matching to avoid being too strict.
         """
+        cdef list state_components
+        cdef int total_correct_blocks, total_goal_blocks, best_match, best_idx
+        cdef double match_percentage, threshold
+        cdef list goal_component_sets, state_component_sets
+        cdef set matched_state_indices, gc, sc
+        
         state_components = self.agent.find_disconnected_components(state)
         
         # If we have fewer components than the goal, we're definitely not done
@@ -738,12 +809,16 @@ class DisconnectedGoalHandler:
         threshold = 0.90
         return match_percentage >= threshold
 
-    def get_disconnected_valid_moves(self, state, goal_components):
+    cpdef list get_disconnected_valid_moves(self, state, goal_components):
         """
         Generate valid moves for disconnected components
         Allows moves that maintain connectivity within each component
         But doesn't require connectivity between components
         """
+        cdef list current_components, all_moves, component_moves, basic_moves, chain_moves, sliding_moves, valid_moves
+        cdef object component_state
+        cdef set component, new_state
+        
         # Find the components in the current state
         current_components = self.agent.find_disconnected_components(state)
     
@@ -776,7 +851,7 @@ class DisconnectedGoalHandler:
     
         return all_moves
     
-    def sequential_from_strategic_position(self, strategic_state, time_limit=60):
+    cpdef list sequential_from_strategic_position(self, strategic_state, double time_limit=60):
         """
         Apply the sequential component-by-component approach starting from
         the strategic position achieved in Phase 1.
@@ -788,6 +863,14 @@ class DisconnectedGoalHandler:
         Returns:
             List of states representing the path
         """
+        cdef double start_time, remaining_time
+        cdef set current_state, component_initial, component_goal, final_component_state
+        cdef dict assignments
+        cdef list combined_path, component_time_limits, component_path, other_blocks_list, cleanup_path
+        cdef int total_blocks, expected_count, i
+        cdef set all_obstacles, other_blocks
+        cdef bint final_match
+        
         print(f"Starting sequential approach from strategic position")
         start_time = time.time()
 
@@ -901,7 +984,7 @@ class DisconnectedGoalHandler:
         
         return combined_path
     
-    def cleanup_and_retry(self, current_state, time_limit=20):
+    cpdef list cleanup_and_retry(self, current_state, double time_limit=20):
         """
         Cleanup phase with strict block count verification.
         
@@ -912,6 +995,15 @@ class DisconnectedGoalHandler:
         Returns:
             List of states representing the additional path
         """
+        cdef double start_time, remaining_time
+        cdef int original_block_count, i
+        cdef set current_state_set, blocks_at_goal, blocks_not_at_goal, unfilled_goals
+        cdef list clusters, cleanup_path, target_goals, goal_path
+        cdef list cluster_distances
+        cdef int anchor_idx
+        cdef set non_goal_cluster, initial_blocks_at_goal
+        cdef bint is_connected
+        
         print("Starting cleanup phase...")
         start_time = time.time()
         
@@ -1087,7 +1179,7 @@ class DisconnectedGoalHandler:
         print(f"Cleanup complete with {len(cleanup_path)} states")
         return cleanup_path
     
-    def reconnect_clusters_strict(self, clusters, cluster_distances, current_state, blocks_at_goal, cleanup_path, original_block_count):
+    cpdef set reconnect_clusters_strict(self, list clusters, list cluster_distances, current_state, set blocks_at_goal, list cleanup_path, int original_block_count):
         """
         Individual block movement with continuous connectivity checks.
         
@@ -1102,7 +1194,15 @@ class DisconnectedGoalHandler:
         Returns:
             Set of connected non-goal blocks
         """
-        print(f"Current time: 2025-05-06 05:45:44, User: GeorgeAbouIssa")
+        cdef int anchor_idx, blocks_to_move, blocks_moved, last_idx
+        cdef set current_blocks, remaining_cluster, connected_blocks
+        cdef tuple movable_block, connected_block, target_block
+        cdef list other_clusters_indices, path, temp_path
+        cdef bint is_connected
+        cdef set temp_cluster, obstacles
+        cdef tuple current_pos, new_pos
+        
+        print(f"Current time: 2025-05-06 06:14:32, User: GeorgeAbouIssa")
         print(f"Starting reconnection with {len(clusters)} clusters")
         
         # The closest cluster is our anchor
@@ -1283,8 +1383,8 @@ class DisconnectedGoalHandler:
         # Return non-goal blocks
         return current_blocks - blocks_at_goal
     
-    def check_and_reconnect_blocks(self, current_blocks, blocks_at_goal, connected_blocks, 
-                                   remaining_cluster, cleanup_path, original_block_count):
+    cpdef check_and_reconnect_blocks(self, set current_blocks, set blocks_at_goal, set connected_blocks, 
+                                   set remaining_cluster, list cleanup_path, int original_block_count):
         """
         Check if there are blocks that need to be reconnected and handle them.
         
@@ -1296,6 +1396,18 @@ class DisconnectedGoalHandler:
             cleanup_path: Path being built
             original_block_count: Original number of blocks to maintain
         """
+        cdef set non_goal_blocks
+        cdef list all_clusters
+        cdef int main_cluster_idx, max_overlap, i, overlap
+        cdef set main_cluster, cluster_set
+        cdef tuple pos1, pos2, movable_block, main_block, current_pos, new_pos
+        cdef double min_distance
+        cdef tuple closest_pair
+        cdef list path, temp_path
+        cdef tuple target_block
+        cdef set obstacles
+        cdef int last_idx
+        
         # First identify all blocks not at goal positions
         non_goal_blocks = current_blocks - blocks_at_goal
         
@@ -1310,33 +1422,33 @@ class DisconnectedGoalHandler:
         if len(all_clusters) <= 1:
             return
         
-        print(f"Found {len(all_clusters)} disconnected components after moving block")
+        print(f"Found {len(all_clusters)} disconnected components after block move")
         
-        # Identify the main connected component (the one with the most blocks 
-        # from the original connected_blocks)
+        # Identify which cluster contains most of the connected blocks
+        # (this should be our main cluster that we're building)
         main_cluster_idx = 0
         max_overlap = 0
         
-        for i, cluster in enumerate(all_clusters):
-            cluster_set = set(cluster)
+        for i, cluster_set in enumerate(all_clusters):
             overlap = len(cluster_set.intersection(connected_blocks))
-            
             if overlap > max_overlap:
                 max_overlap = overlap
                 main_cluster_idx = i
         
         main_cluster = set(all_clusters[main_cluster_idx])
-        print(f"Main cluster has {len(main_cluster)} blocks")
         
-        # For each other cluster, try to reconnect it
-        for i, cluster in enumerate(all_clusters):
+        # Process each other cluster, trying to connect it to the main cluster
+        for i, cluster_set in enumerate(all_clusters):
             if i == main_cluster_idx:
+                continue  # Skip the main cluster
+                
+            # Skip empty clusters
+            if not cluster_set:
                 continue
                 
-            cluster_set = set(cluster)
-            print(f"Processing disconnected cluster {i} with {len(cluster_set)} blocks")
+            print(f"Reconnecting cluster with {len(cluster_set)} blocks to main cluster")
             
-            # Find the closest pair of blocks between this cluster and the main cluster
+            # Find the closest pair of blocks between the clusters
             closest_pair = None
             min_distance = float('inf')
             
@@ -1348,34 +1460,36 @@ class DisconnectedGoalHandler:
                         closest_pair = (pos1, pos2)
             
             if not closest_pair:
-                print(f"No valid connection found for disconnected cluster {i}")
+                print(f"No valid connection found between clusters")
+                # Just add these blocks to the connected blocks collection
+                connected_blocks.update(cluster_set)
                 continue
                 
             source_pos, target_pos = closest_pair
             
-            # For very close clusters, nothing needs to be done
-            if min_distance <= 1:
-                print(f"Disconnected cluster {i} is already adjacent to main cluster")
+            # For very close clusters, just combine them directly
+            if min_distance <= 2:
+                connected_blocks.update(cluster_set)
+                print(f"Clusters are very close, direct connection made")
                 continue
             
-            print(f"Reconnecting cluster {i} at distance {min_distance}")
-            
-            # Find a block in the disconnected cluster that can be moved
+            # Identify movable blocks in the separated cluster
             movable_block = None
-            
             for block in cluster_set:
-                # Check if removing this block maintains connectivity
+                # Check if removing this block maintains connectivity of the cluster
                 temp_cluster = cluster_set - {block}
                 
-                # If empty or still connected, we can move this block
+                # If only one block, or removing it maintains connectivity
                 if not temp_cluster or self.agent.is_connected(temp_cluster):
                     movable_block = block
                     break
             
             if not movable_block:
-                print(f"No block can be moved from disconnected cluster {i}")
+                print(f"No movable blocks found in cluster")
+                # Just add all blocks to connected blocks
+                connected_blocks.update(cluster_set)
                 continue
-            
+                
             # Find a path for this block to the main cluster
             path = None
             target_block = None
@@ -1383,7 +1497,7 @@ class DisconnectedGoalHandler:
             # Try to find a path to any block in the main cluster
             for main_block in main_cluster:
                 obstacles = ((current_blocks - {movable_block, main_block}) | 
-                             self.agent.obstacles | blocks_at_goal)
+                              self.agent.obstacles | blocks_at_goal)
                 
                 temp_path = self.agent.find_clean_path(movable_block, main_block, obstacles)
                 
@@ -1392,14 +1506,24 @@ class DisconnectedGoalHandler:
                     target_block = main_block
             
             if not path:
-                print(f"No valid path found to reconnect cluster {i}")
+                print(f"No valid path found to reconnect cluster")
+                # Just add all blocks to connected blocks
+                connected_blocks.update(cluster_set)
                 continue
+                
+            print(f"Found path of length {len(path)} to reconnect cluster")
             
-            print(f"Found path of length {len(path)} to reconnect")
-            
-            # Similar movement logic as in the main function
             # Remove the block from its current position
             current_blocks.remove(movable_block)
+            cluster_set.remove(movable_block)
+            
+            # Move the block along the path
+            # We'll go to the second-to-last position to avoid colliding with the target
+            last_idx = min(len(path) - 2, min_distance)
+            
+            # If path is too short, just use the last valid position
+            if last_idx < 1:
+                last_idx = 1 if len(path) > 1 else 0
             
             # Verify block count after removal
             assert len(current_blocks) == original_block_count - 1, f"Block count mismatch after removal: {len(current_blocks)}"
@@ -1407,24 +1531,25 @@ class DisconnectedGoalHandler:
             # Add state to show removal
             cleanup_path.append(list(current_blocks))
             
-            # Move the block to connect the clusters
-            last_idx = len(path) - 2
-            if last_idx < 1:
-                last_idx = 1 if len(path) > 1 else 0
-            
+            # Walk the block through each step of the path
             current_pos = None
             
             for i in range(1, last_idx + 1):
+                # Get the next position in the path
                 new_pos = path[i]
                 
+                # Check if this position is valid
                 if (new_pos not in current_blocks and 
                     new_pos not in blocks_at_goal and
                     new_pos not in self.agent.obstacles):
                     
+                    # If we had placed the block somewhere earlier, remove it
                     if current_pos:
                         current_blocks.remove(current_pos)
+                        # Add state to show removal
                         cleanup_path.append(list(current_blocks))
                     
+                    # Place the block at the new position
                     current_blocks.add(new_pos)
                     current_pos = new_pos
                     
@@ -1434,88 +1559,29 @@ class DisconnectedGoalHandler:
                     # Add state to show the move
                     cleanup_path.append(list(current_blocks))
                 else:
+                    # Position already occupied, try next
+                    print(f"Position {new_pos} is occupied, trying next")
                     continue
             
-            # If we successfully reconnected, update the main cluster
+            # If we successfully placed the block somewhere, count it
             if current_pos:
-                print(f"Successfully reconnected cluster {i}")
                 main_cluster.add(current_pos)
-                main_cluster.update(cluster_set - {movable_block})
-        else:
-            # Couldn't reconnect, add the block back
-            print(f"Failed to reconnect cluster {i}")
-            current_blocks.add(movable_block)
-            
-            # Verify block count
-            assert len(current_blocks) == original_block_count, f"Block count mismatch: {len(current_blocks)}"
-            
-            # Add state to show the rollback
-            cleanup_path.append(list(current_blocks))
-    
-        # Update connected_blocks with the main cluster
-        connected_blocks.clear()
-        connected_blocks.update(main_cluster)
-
-    def detect_and_fix_connection(self, cluster1, cluster2):
-        """
-        Detects if two clusters are adjacent and fixes the connection if needed.
-    
-        Args:
-            cluster1: First cluster as a set of positions
-            cluster2: Second cluster as a set of positions
-        
-        Returns:
-            (bool, list): Tuple with connection status and bridge positions if needed
-        """
-        # Check if any block in cluster1 is adjacent to any block in cluster2
-        for pos1 in cluster1:
-            for pos2 in cluster2:
-                if abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1]) == 1:
-                    # Clusters are already adjacent
-                    return True, []
-    
-        # Find the closest pair of blocks
-        min_distance = float('inf')
-        closest_pair = None
-    
-        for pos1 in cluster1:
-            for pos2 in cluster2:
-                dist = abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
-                if dist < min_distance:
-                    min_distance = dist
-                    closest_pair = (pos1, pos2)
-    
-        if not closest_pair:
-            return False, []
-
-        # Calculate direct path between the closest blocks
-        pos1, pos2 = closest_pair
-        dx = pos2[0] - pos1[0]
-        dy = pos2[1] - pos1[1]
-
-        # Create bridge positions
-        bridge = []
-
-        # Priority: move in the dimension with larger distance first
-        if abs(dx) > abs(dy):
-            # Move in x direction first
-            x_dir = 1 if dx > 0 else -1
-            for i in range(1, abs(dx)):
-                bridge.append((pos1[0] + i * x_dir, pos1[1]))
-
-            # Then move in y direction
-            y_dir = 1 if dy > 0 else -1
-            for i in range(1, abs(dy) + 1):
-                bridge.append((pos2[0], pos1[1] + i * y_dir))
-        else:
-            # Move in y direction first
-            y_dir = 1 if dy > 0 else -1
-            for i in range(1, abs(dy)):
-                bridge.append((pos1[0], pos1[1] + i * y_dir))
-
-            # Then move in x direction
-            x_dir = 1 if dx > 0 else -1
-            for i in range(1, abs(dx) + 1):
-                bridge.append((pos1[0] + i * x_dir, pos2[1]))
-
-        return False, bridge
+                connected_blocks.add(current_pos)
+                print(f"Successfully moved block to {current_pos} to reconnect cluster")
+                
+                # Add remaining blocks from this cluster to connected blocks
+                connected_blocks.update(cluster_set)
+            else:
+                # Couldn't place the block anywhere, add it back
+                print(f"Failed to move block, adding back")
+                current_blocks.add(movable_block)
+                cluster_set.add(movable_block)
+                
+                # Verify block count
+                assert len(current_blocks) == original_block_count, f"Block count mismatch: {len(current_blocks)}"
+                
+                # Add state to show the rollback
+                cleanup_path.append(list(current_blocks))
+                
+                # Add all blocks to connected blocks collection
+                connected_blocks.update(cluster_set)
